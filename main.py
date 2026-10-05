@@ -1,264 +1,257 @@
 import cv2
 import mediapipe as mp
+import time
+import math
 
-from pathlib import Path
-
-from cv_controller.config import (
-    CAMERA_INDEX,
-    FRAME_WIDTH,
-    FRAME_HEIGHT,
-    MIN_DETECTION_CONFIDENCE,
-    MIN_TRACKING_CONFIDENCE,
-)
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
 
-# --------------------------------------------------
-# MediaPipe Tasks
-# --------------------------------------------------
-
-BaseOptions = mp.tasks.BaseOptions
-VisionRunningMode = mp.tasks.vision.RunningMode
-HandLandmarker = mp.tasks.vision.HandLandmarker
-HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+MODEL_PATH = "models/hand_landmarker.task"
 
 
-# --------------------------------------------------
-# Paths
-# --------------------------------------------------
+# ---------------------------------------------------------
+# Geometry helpers
+# ---------------------------------------------------------
 
-BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "models" / "hand_landmarker.task"
+def distance(a, b):
+    return math.sqrt(
+        (a.x - b.x) ** 2 +
+        (a.y - b.y) ** 2
+    )
 
+
+def finger_is_extended(landmarks, tip, pip):
+    """
+    Determines whether a finger is extended by comparing
+    the fingertip distance from the wrist against the PIP joint.
+    """
+
+    wrist = landmarks[0]
+
+    tip_distance = distance(landmarks[tip], wrist)
+    pip_distance = distance(landmarks[pip], wrist)
+
+    return tip_distance > pip_distance * 1.15
+
+
+def thumb_is_extended(landmarks):
+    """
+    Thumb uses a different geometry because it moves sideways
+    relative to the other fingers.
+    """
+
+    wrist = landmarks[0]
+    thumb_tip = landmarks[4]
+    thumb_ip = landmarks[3]
+
+    return distance(thumb_tip, wrist) > distance(thumb_ip, wrist) * 1.1
+
+
+# ---------------------------------------------------------
+# Finger-gun classifier
+# ---------------------------------------------------------
+
+def detect_finger_gun(hand_landmarks):
+
+    index_extended = finger_is_extended(
+        hand_landmarks,
+        tip=8,
+        pip=6
+    )
+
+    middle_extended = finger_is_extended(
+        hand_landmarks,
+        tip=12,
+        pip=10
+    )
+
+    ring_extended = finger_is_extended(
+        hand_landmarks,
+        tip=16,
+        pip=14
+    )
+
+    pinky_extended = finger_is_extended(
+        hand_landmarks,
+        tip=20,
+        pip=18
+    )
+
+    thumb_extended = thumb_is_extended(hand_landmarks)
+
+    finger_gun = (
+        index_extended
+        and thumb_extended
+        and not middle_extended
+        and not ring_extended
+        and not pinky_extended
+    )
+
+    return finger_gun, {
+        "THUMB": thumb_extended,
+        "INDEX": index_extended,
+        "MIDDLE": middle_extended,
+        "RING": ring_extended,
+        "PINKY": pinky_extended,
+    }
+
+
+# ---------------------------------------------------------
+# Main
+# ---------------------------------------------------------
 
 def main():
 
-    # ----------------------------------------------
-    # Check model
-    # ----------------------------------------------
+    BaseOptions = python.BaseOptions
+    VisionRunningMode = vision.RunningMode
 
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(
-            f"Hand Landmarker model not found:\n{MODEL_PATH}\n\n"
-            "Download hand_landmarker.task and place it inside the models folder."
-        )
-
-    # ----------------------------------------------
-    # Camera
-    # ----------------------------------------------
-
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-
-    if not cap.isOpened():
-        raise RuntimeError(
-            "Could not open webcam. "
-            "Check CAMERA_INDEX in config.py."
-        )
-
-    # ----------------------------------------------
-    # Hand Landmarker configuration
-    # ----------------------------------------------
-
-    options = HandLandmarkerOptions(
+    options = vision.HandLandmarkerOptions(
         base_options=BaseOptions(
-            model_asset_path=str(MODEL_PATH)
+            model_asset_path=MODEL_PATH
         ),
-
         running_mode=VisionRunningMode.VIDEO,
-
-        num_hands=2,
-
-        min_hand_detection_confidence=MIN_DETECTION_CONFIDENCE,
-
-        min_hand_presence_confidence=MIN_DETECTION_CONFIDENCE,
-
-        min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
+        num_hands=1
     )
 
-    # ----------------------------------------------
-    # Create detector
-    # ----------------------------------------------
+    cap = cv2.VideoCapture(0)
 
-    with HandLandmarker.create_from_options(options) as detector:
+    if not cap.isOpened():
+        print("ERROR: Could not open webcam.")
+        return
 
-        frame_timestamp_ms = 0
+    start_time = time.time()
+
+    with vision.HandLandmarker.create_from_options(options) as detector:
 
         while True:
 
-            success, frame = cap.read()
+            ret, frame = cap.read()
 
-            if not success:
-                print("Could not read webcam frame.")
+            if not ret:
+                print("ERROR: Could not read webcam frame.")
                 break
 
-            # Mirror webcam
+            # Mirror webcam like a normal selfie camera
             frame = cv2.flip(frame, 1)
 
-            # OpenCV BGR → MediaPipe RGB
-            rgb_frame = cv2.cvtColor(
+            rgb = cv2.cvtColor(
                 frame,
                 cv2.COLOR_BGR2RGB
             )
 
-            # Create MediaPipe Image
             mp_image = mp.Image(
                 image_format=mp.ImageFormat.SRGB,
-                data=rgb_frame
+                data=rgb
             )
 
-            # Timestamp must increase for VIDEO mode
-            frame_timestamp_ms += 33
+            timestamp_ms = int(
+                (time.time() - start_time) * 1000
+            )
 
-            # Run hand detection
             result = detector.detect_for_video(
                 mp_image,
-                frame_timestamp_ms
+                timestamp_ms
             )
 
-            # --------------------------------------
-            # Draw detected hands
-            # --------------------------------------
+            # -------------------------------------------------
+            # Draw / classify hand
+            # -------------------------------------------------
+
+            status = "NO HAND"
 
             if result.hand_landmarks:
 
-                for hand_index, landmarks in enumerate(
-                    result.hand_landmarks
-                ):
+                hand = result.hand_landmarks[0]
 
-                    # Draw points
-                    for landmark in landmarks:
+                finger_gun, fingers = detect_finger_gun(hand)
 
-                        x = int(
-                            landmark.x * frame.shape[1]
-                        )
+                # Draw landmarks
+                for landmark in hand:
 
-                        y = int(
-                            landmark.y * frame.shape[0]
-                        )
+                    x = int(landmark.x * frame.shape[1])
+                    y = int(landmark.y * frame.shape[0])
 
-                        cv2.circle(
-                            frame,
-                            (x, y),
-                            5,
-                            (0, 255, 0),
-                            -1
-                        )
+                    cv2.circle(
+                        frame,
+                        (x, y),
+                        4,
+                        (0, 255, 0),
+                        -1
+                    )
 
-                    # Draw connections
-                    connections = [
-                        (0, 1), (1, 2), (2, 3), (3, 4),
-                        (0, 5), (5, 6), (6, 7), (7, 8),
-                        (0, 9), (9, 10), (10, 11), (11, 12),
-                        (0, 13), (13, 14), (14, 15), (15, 16),
-                        (0, 17), (17, 18), (18, 19), (19, 20),
+                # Draw connections
+                connections = [
+                    (0, 1), (1, 2), (2, 3), (3, 4),
+                    (0, 5), (5, 6), (6, 7), (7, 8),
+                    (0, 9), (9, 10), (10, 11), (11, 12),
+                    (0, 13), (13, 14), (14, 15), (15, 16),
+                    (0, 17), (17, 18), (18, 19), (19, 20),
+                    (5, 9), (9, 13), (13, 17)
+                ]
 
-                        (5, 9),
-                        (9, 13),
-                        (13, 17),
-                    ]
+                for a, b in connections:
 
-                    for start, end in connections:
+                    x1 = int(hand[a].x * frame.shape[1])
+                    y1 = int(hand[a].y * frame.shape[0])
 
-                        x1 = int(
-                            landmarks[start].x * frame.shape[1]
-                        )
+                    x2 = int(hand[b].x * frame.shape[1])
+                    y2 = int(hand[b].y * frame.shape[0])
 
-                        y1 = int(
-                            landmarks[start].y * frame.shape[0]
-                        )
+                    cv2.line(
+                        frame,
+                        (x1, y1),
+                        (x2, y2),
+                        (0, 255, 0),
+                        2
+                    )
 
-                        x2 = int(
-                            landmarks[end].x * frame.shape[1]
-                        )
+                if finger_gun:
+                    status = "FINGER GUN"
+                else:
+                    status = "HAND DETECTED"
 
-                        y2 = int(
-                            landmarks[end].y * frame.shape[0]
-                        )
+                # Finger states
+                y = 40
 
-                        cv2.line(
-                            frame,
-                            (x1, y1),
-                            (x2, y2),
-                            (0, 255, 0),
-                            2
-                        )
+                for name, state in fingers.items():
 
-                    # ----------------------------------
-                    # Hand label
-                    # ----------------------------------
+                    text = f"{name}: {'EXTENDED' if state else 'CURLED'}"
 
-                    if result.handedness:
+                    cv2.putText(
+                        frame,
+                        text,
+                        (20, y),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 255),
+                        2
+                    )
 
-                        handedness = result.handedness[
-                            hand_index
-                        ][0]
+                    y += 30
 
-                        label = handedness.display_name
-
-                        wrist = landmarks[0]
-
-                        text_x = int(
-                            wrist.x * frame.shape[1]
-                        )
-
-                        text_y = int(
-                            wrist.y * frame.shape[0]
-                        ) - 20
-
-                        cv2.putText(
-                            frame,
-                            label,
-                            (text_x, text_y),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.7,
-                            (0, 255, 0),
-                            2
-                        )
-
-            # --------------------------------------
-            # UI
-            # --------------------------------------
+            # -------------------------------------------------
+            # Main status
+            # -------------------------------------------------
 
             cv2.putText(
                 frame,
-                "CV SNIPER",
-                (30, 45),
+                f"STATUS: {status}",
+                (20, frame.shape[0] - 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                1.2,
-                (255, 255, 255),
+                0.9,
+                (0, 255, 255),
                 2
-            )
-
-            cv2.putText(
-                frame,
-                "HAND TRACKING: ACTIVE",
-                (30, 85),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 0),
-                2
-            )
-
-            cv2.putText(
-                frame,
-                "Press Q or ESC to quit",
-                (30, 120),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (220, 220, 220),
-                1
             )
 
             cv2.imshow(
-                "CV Sniper - Phase 1",
+                "CV Sniper - Gesture Test",
                 frame
             )
 
             key = cv2.waitKey(1) & 0xFF
 
-            if key == ord("q") or key == 27:
+            if key == ord("q"):
                 break
 
     cap.release()
