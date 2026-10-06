@@ -188,9 +188,9 @@ def draw_hud(frame, state, finger_gun):
 
     h, w = frame.shape[:2]
 
-    # -----------------------------------------------------
-    # Top bar
-    # -----------------------------------------------------
+    # =====================================================
+    # NORMAL HUD
+    # =====================================================
 
     cv2.rectangle(
         frame,
@@ -200,7 +200,6 @@ def draw_hud(frame, state, finger_gun):
         -1
     )
 
-    # Weapon
     cv2.putText(
         frame,
         "WEAPON: SNIPER RIFLE",
@@ -211,12 +210,9 @@ def draw_hud(frame, state, finger_gun):
         2
     )
 
-    # State
-    state_text = state.name
-
     cv2.putText(
         frame,
-        f"STATE: {state_text}",
+        f"STATE: {state.name}",
         (20, 57),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.65,
@@ -224,15 +220,7 @@ def draw_hud(frame, state, finger_gun):
         2
     )
 
-    # -----------------------------------------------------
-    # Gesture indicator
-    # -----------------------------------------------------
-
-    gesture_text = (
-        "FINGER GUN"
-        if finger_gun
-        else "NONE"
-    )
+    gesture_text = "FINGER GUN" if finger_gun else "NONE"
 
     cv2.putText(
         frame,
@@ -244,79 +232,120 @@ def draw_hud(frame, state, finger_gun):
         2
     )
 
-    # -----------------------------------------------------
-    # Scope
-    # -----------------------------------------------------
+    # =====================================================
+    # SNIPER SCOPE
+    # =====================================================
 
     if state == GameState.SCOPED:
 
-        # Dark vignette-like overlay
+        center_x = w // 2
+        center_y = h // 2
+
+        radius = int(min(w, h) * 0.38)
+
+        # ---------------------------------------------
+        # Darken entire screen
+        # ---------------------------------------------
+
         overlay = frame.copy()
 
-        cv2.circle(
+        cv2.rectangle(
             overlay,
-            (w // 2, h // 2),
-            min(w, h) // 3,
+            (0, 0),
+            (w, h),
             (0, 0, 0),
             -1
         )
 
-        # Keep circular scope area visible
-        mask = frame.copy()
-
-        cv2.circle(
-            mask,
-            (w // 2, h // 2),
-            min(w, h) // 3,
-            (0, 0, 0),
-            -1
+        # Blend darkness over camera
+        cv2.addWeighted(
+            overlay,
+            0.72,
+            frame,
+            0.28,
+            0,
+            frame
         )
 
-        # Draw scope
-        radius = min(w, h) // 3
+        # ---------------------------------------------
+        # Scope circle
+        # ---------------------------------------------
 
         cv2.circle(
             frame,
-            (w // 2, h // 2),
+            (center_x, center_y),
             radius,
-            (255, 255, 255),
-            3
+            (220, 220, 220),
+            5
         )
 
+        # ---------------------------------------------
+        # Crosshair
+        # ---------------------------------------------
+
+        crosshair_length = radius
+
+        # Horizontal
         cv2.line(
             frame,
-            (w // 2 - radius, h // 2),
-            (w // 2 + radius, h // 2),
-            (255, 255, 255),
-            1
+            (center_x - crosshair_length, center_y),
+            (center_x + crosshair_length, center_y),
+            (220, 220, 220),
+            2
         )
 
+        # Vertical
         cv2.line(
             frame,
-            (w // 2, h // 2 - radius),
-            (w // 2, h // 2 + radius),
-            (255, 255, 255),
-            1
+            (center_x, center_y - crosshair_length),
+            (center_x, center_y + crosshair_length),
+            (220, 220, 220),
+            2
         )
+
+        # ---------------------------------------------
+        # Center aiming point
+        # ---------------------------------------------
 
         cv2.circle(
             frame,
-            (w // 2, h // 2),
-            4,
+            (center_x, center_y),
+            7,
             (0, 0, 255),
             -1
         )
 
-        cv2.putText(
+        cv2.circle(
             frame,
-            "SCOPED",
-            (w // 2 - 50, h // 2 + radius + 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
+            (center_x, center_y),
+            13,
             (255, 255, 255),
             2
         )
 
+        # ---------------------------------------------
+        # Scope information
+        # ---------------------------------------------
+
+        cv2.putText(
+            frame,
+            "● LIVE SCOPE",
+            (center_x - 90, center_y - radius + 35),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 0, 255),
+            2
+        )
+
+        cv2.putText(
+            frame,
+            "TARGET ACQUISITION",
+            (center_x - 110, center_y + radius - 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (220, 220, 220),
+            2
+        )
 
 # =========================================================
 # MAIN
