@@ -19,7 +19,11 @@ class GameState(Enum):
     IDLE = 0
     EQUIPPED = 1
     SCOPED = 2
-
+class EyeState(Enum):
+    OPEN = 0
+    CLOSED = 1
+eye_state = EyeState.OPEN
+blink_start_time = 0
 
 # =========================================================
 # GEOMETRY
