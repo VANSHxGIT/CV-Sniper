@@ -97,6 +97,46 @@ def detect_finger_gun(hand):
 
     return finger_gun
 
+def landmark_distance(a, b):
+    return math.sqrt(
+        (a.x - b.x) ** 2 +
+        (a.y - b.y) ** 2
+    )
+
+
+# MediaPipe Face Landmarker eye indices
+LEFT_EYE = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE = [362, 385, 387, 263, 373, 380]
+
+
+def eye_aspect_ratio(face_landmarks, eye_indices):
+    p1, p2, p3, p4, p5, p6 = [
+        face_landmarks[i] for i in eye_indices
+    ]
+
+    vertical_1 = landmark_distance(p2, p6)
+    vertical_2 = landmark_distance(p3, p5)
+    horizontal = landmark_distance(p1, p4)
+
+    if horizontal == 0:
+        return 0.0
+
+    return (vertical_1 + vertical_2) / (2.0 * horizontal)
+
+
+def get_eye_aspect_ratio(face_landmarks):
+    left_ear = eye_aspect_ratio(
+        face_landmarks,
+        LEFT_EYE
+    )
+
+    right_ear = eye_aspect_ratio(
+        face_landmarks,
+        RIGHT_EYE
+    )
+
+    return (left_ear + right_ear) / 2.0
+
 
 # =========================================================
 # HAND POSITION
