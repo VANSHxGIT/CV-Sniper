@@ -12,11 +12,8 @@ from mediapipe.tasks.python import vision
 
 # ============================================================
 # CV SNIPER - STAGE 3
-# Hand Tracking + Finger Gun + Scope + Blink-to-Fire
+# Hand Tracking + Face Tracking + Scope + Blink-to-Fire
 # ============================================================
-
-
-# -------------------- CONFIGURATION -------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -24,22 +21,17 @@ HAND_MODEL_PATH = BASE_DIR / "models" / "hand_landmarker.task"
 FACE_MODEL_PATH = BASE_DIR / "models" / "face_landmarker.task"
 
 CAMERA_INDEX = 0
-
-# Hand detection settings
 HAND_RAISED_THRESHOLD = 0.55
 
-# Eye blink settings
 CLOSED_THRESHOLD = 0.20
 OPEN_THRESHOLD = 0.23
 
 MIN_BLINK_DURATION_MS = 50
 MAX_BLINK_DURATION_MS = 500
 
-# Firing settings
 FIRE_DISPLAY_MS = 450
 FIRE_COOLDOWN_MS = 800
 
-# Display
 WINDOW_NAME = "CV SNIPER | Stage 3"
 
 
@@ -56,6 +48,8 @@ class EyeState(Enum):
     CLOSED = 1
 
 
+# -------------------- RUNTIME STATE -------------------------
+
 state = GameState.IDLE
 eye_state = EyeState.OPEN
 
@@ -64,10 +58,9 @@ last_fire_time = -FIRE_COOLDOWN_MS
 last_fire_display_time = -FIRE_DISPLAY_MS
 
 
-# -------------------- HAND GEOMETRY ------------------------
+# -------------------- GEOMETRY ------------------------------
 
 def distance(a, b):
-    """Euclidean distance between two normalized landmarks."""
     return math.sqrt(
         (a.x - b.x) ** 2 +
         (a.y - b.y) ** 2
@@ -75,35 +68,24 @@ def distance(a, b):
 
 
 def finger_is_extended(landmarks, tip, pip):
-    """Estimate whether a finger is extended using wrist distance."""
     wrist = landmarks[0]
 
-    tip_distance = distance(landmarks[tip], wrist)
-    pip_distance = distance(landmarks[pip], wrist)
-
-    return tip_distance > pip_distance * 1.15
+    return (
+        distance(landmarks[tip], wrist)
+        > distance(landmarks[pip], wrist) * 1.15
+    )
 
 
 def thumb_is_extended(landmarks):
-    """Estimate whether the thumb is extended."""
     wrist = landmarks[0]
 
-    thumb_tip = landmarks[4]
-    thumb_ip = landmarks[3]
-
     return (
-        distance(thumb_tip, wrist)
-        > distance(thumb_ip, wrist) * 1.10
+        distance(landmarks[4], wrist)
+        > distance(landmarks[3], wrist) * 1.10
     )
 
 
 def detect_finger_gun(hand):
-    """
-    Finger-gun gesture:
-    - Index extended
-    - Thumb extended
-    - Middle, ring and little fingers curled
-    """
     index = finger_is_extended(hand, 8, 6)
     middle = finger_is_extended(hand, 12, 10)
     ring = finger_is_extended(hand, 16, 14)
@@ -111,8 +93,7 @@ def detect_finger_gun(hand):
     thumb = thumb_is_extended(hand)
 
     return (
-        index
-        and thumb
+        index and thumb
         and not middle
         and not ring
         and not pinky
@@ -120,32 +101,26 @@ def detect_finger_gun(hand):
 
 
 def get_hand_center(hand):
-    x = sum(point.x for point in hand) / len(hand)
-    y = sum(point.y for point in hand) / len(hand)
-
-    return x, y
+    return (
+        sum(p.x for p in hand) / len(hand),
+        sum(p.y for p in hand) / len(hand)
+    )
 
 
 def is_hand_raised(hand):
     _, center_y = get_hand_center(hand)
-
     return center_y < HAND_RAISED_THRESHOLD
 
 
-# -------------------- EYE GEOMETRY -------------------------
+# -------------------- EYE TRACKING --------------------------
 
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 
 
-def eye_aspect_ratio(face_landmarks, eye_indices):
-    """
-    Calculate eye aspect ratio (EAR).
-
-    Lower values generally indicate a closed eye.
-    """
+def eye_aspect_ratio(face_landmarks, indices):
     p1, p2, p3, p4, p5, p6 = [
-        face_landmarks[i] for i in eye_indices
+        face_landmarks[i] for i in indices
     ]
 
     vertical_1 = distance(p2, p6)
@@ -161,20 +136,13 @@ def eye_aspect_ratio(face_landmarks, eye_indices):
 
 
 def get_eye_aspect_ratio(face_landmarks):
-    left_ear = eye_aspect_ratio(
-        face_landmarks,
-        LEFT_EYE
-    )
+    left = eye_aspect_ratio(face_landmarks, LEFT_EYE)
+    right = eye_aspect_ratio(face_landmarks, RIGHT_EYE)
 
-    right_ear = eye_aspect_ratio(
-        face_landmarks,
-        RIGHT_EYE
-    )
-
-    return (left_ear + right_ear) / 2.0
+    return (left + right) / 2.0
 
 
-# -------------------- HAND LANDMARK DRAWING ----------------
+# -------------------- HAND DRAWING --------------------------
 
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
@@ -186,41 +154,88 @@ HAND_CONNECTIONS = [
 ]
 
 
-def draw_hand_landmarks(frame, hand_landmarks):
+def draw_hand_landmarks(frame, hand):
     height, width = frame.shape[:2]
 
-    points = []
+    points = [
+        (int(p.x * width), int(p.y * height))
+        for p in hand
+    ]
 
-    for landmark in hand_landmarks:
-        x = int(landmark.x * width)
-        y = int(landmark.y * height)
-        points.append((x, y))
-
-    # Draw connections
     for start, end in HAND_CONNECTIONS:
         cv2.line(
             frame,
             points[start],
             points[end],
             (0, 255, 0),
-            2
+            2,
+            cv2.LINE_AA
         )
 
-    # Draw landmark points
     for point in points:
         cv2.circle(
-            frame,
-            point,
-            3,
-            (0, 180, 255),
-            -1
+            frame, point, 3,
+            (0, 180, 255), -1,
+            cv2.LINE_AA
         )
 
 
-# -------------------- SCOPE OVERLAY ------------------------
+# -------------------- FACE DRAWING -------------------------
+
+def draw_face_landmarks(frame, face_landmarks):
+    height, width = frame.shape[:2]
+
+    # Draw all detected face landmarks.
+    for landmark in face_landmarks:
+        x = int(landmark.x * width)
+        y = int(landmark.y * height)
+
+        if 0 <= x < width and 0 <= y < height:
+            cv2.circle(
+                frame, (x, y), 1,
+                (255, 200, 0), -1
+            )
+
+    # Highlight both eyes.
+    eye_paths = [
+        [33, 160, 158, 133, 153, 144, 33],
+        [362, 385, 387, 263, 373, 380, 362]
+    ]
+
+    for path in eye_paths:
+        points = []
+
+        for index in path:
+            landmark = face_landmarks[index]
+            points.append((
+                int(landmark.x * width),
+                int(landmark.y * height)
+            ))
+
+        for i in range(len(points) - 1):
+            cv2.line(
+                frame,
+                points[i],
+                points[i + 1],
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA
+            )
+
+    cv2.putText(
+        frame,
+        "FACE TRACKING: ON",
+        (width - 260, 35),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 200, 0),
+        2
+    )
+
+
+# -------------------- SCOPE DRAWING -------------------------
 
 def draw_scope(frame, firing=False):
-    """Darken the view and draw a visible sniper scope."""
     height, width = frame.shape[:2]
 
     center_x = width // 2
@@ -228,15 +243,22 @@ def draw_scope(frame, firing=False):
 
     radius = max(100, min(width, height) // 3)
 
-    # Darken the scene
+    original = frame.copy()
+
+    # Darken the whole image.
     darkened = cv2.convertScaleAbs(
-        frame,
-        alpha=0.40,
+        original,
+        alpha=0.35,
         beta=0
     )
 
-    # Restore the area inside the scope
-    mask = frame.copy()
+    # Build a circular mask.
+    mask = cv2.cvtColor(
+        cv2.UMat(height, width, cv2.CV_8UC1).get(),
+        cv2.COLOR_GRAY2BGR
+    )
+
+    mask[:] = 0
 
     cv2.circle(
         mask,
@@ -246,42 +268,29 @@ def draw_scope(frame, firing=False):
         -1
     )
 
-    gray_mask = cv2.cvtColor(
+    mask = cv2.cvtColor(
         mask,
         cv2.COLOR_BGR2GRAY
     )
 
-    _, gray_mask = cv2.threshold(
-        gray_mask,
-        127,
-        255,
-        cv2.THRESH_BINARY
+    # Preserve the original camera feed inside the scope.
+    inside = cv2.bitwise_and(
+        original, original, mask=mask
     )
 
-    scope_area = cv2.bitwise_and(
-        frame,
-        frame,
-        mask=gray_mask
+    outside_mask = cv2.bitwise_not(mask)
+
+    outside = cv2.bitwise_and(
+        darkened, darkened, mask=outside_mask
     )
 
-    outside_mask = cv2.bitwise_not(gray_mask)
+    frame[:] = cv2.add(inside, outside)
 
-    dark_area = cv2.bitwise_and(
-        darkened,
-        darkened,
-        mask=outside_mask
-    )
-
-    frame[:] = cv2.add(
-        scope_area,
-        dark_area
-    )
-
-    # Scope circle
     scope_color = (
         (0, 0, 255) if firing else (0, 255, 0)
     )
 
+    # Scope boundary.
     cv2.circle(
         frame,
         (center_x, center_y),
@@ -290,7 +299,7 @@ def draw_scope(frame, firing=False):
         2
     )
 
-    # Crosshair
+    # Crosshairs.
     cv2.line(
         frame,
         (center_x - radius, center_y),
@@ -307,7 +316,7 @@ def draw_scope(frame, firing=False):
         1
     )
 
-    # Center aiming dot
+    # Center aiming dot.
     cv2.circle(
         frame,
         (center_x, center_y),
@@ -319,7 +328,7 @@ def draw_scope(frame, firing=False):
     cv2.putText(
         frame,
         "LIVE SCOPE",
-        (center_x - 65, center_y - radius - 15),
+        (center_x - 65, max(25, center_y - radius - 15)),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
         scope_color,
@@ -330,15 +339,15 @@ def draw_scope(frame, firing=False):
         cv2.putText(
             frame,
             "FIRE!",
-            (center_x - 65, center_y + radius + 40),
+            (center_x - 45, center_y + radius + 35),
             cv2.FONT_HERSHEY_SIMPLEX,
-            1.1,
+            1.0,
             (0, 0, 255),
             3
         )
 
 
-# -------------------- HUD ----------------------------------
+# -------------------- HUD -----------------------------------
 
 def draw_hud(
     frame,
@@ -347,16 +356,15 @@ def draw_hud(
     finger_gun,
     eye_status,
     ear,
-    action,
-    blink_event
+    action
 ):
     height, width = frame.shape[:2]
 
-    # Semi-transparent information panel
-    panel = frame.copy()
+    # Draw the panel on a separate layer.
+    overlay = frame.copy()
 
     cv2.rectangle(
-        panel,
+        overlay,
         (10, 10),
         (350, 225),
         (15, 15, 15),
@@ -364,12 +372,7 @@ def draw_hud(
     )
 
     cv2.addWeighted(
-        panel,
-        0.70,
-        frame,
-        0.30,
-        0,
-        frame
+        overlay, 0.70, frame, 0.30, 0, frame
     )
 
     state_color = (
@@ -396,7 +399,11 @@ def draw_hud(
             else (255, 255, 255)
         ),
         (f"EAR: {ear:.3f}", (255, 255, 255)),
-        (f"ACTION: {action}", (0, 0, 255) if blink_event else (255, 255, 255))
+        (
+            f"ACTION: {action}",
+            (0, 0, 255) if action == "FIRE"
+            else (255, 255, 255)
+        )
     ]
 
     y = 35
@@ -435,18 +442,13 @@ def main():
     global last_fire_time
     global last_fire_display_time
 
-    # Validate model paths
-    if not HAND_MODEL_PATH.is_file():
-        raise FileNotFoundError(
-            f"Hand model not found: {HAND_MODEL_PATH}"
-        )
+    # Check model files.
+    for model_path in (HAND_MODEL_PATH, FACE_MODEL_PATH):
+        if not model_path.is_file():
+            raise FileNotFoundError(
+                f"Model file not found: {model_path}"
+            )
 
-    if not FACE_MODEL_PATH.is_file():
-        raise FileNotFoundError(
-            f"Face model not found: {FACE_MODEL_PATH}"
-        )
-
-    # Configure Hand Landmarker
     hand_options = vision.HandLandmarkerOptions(
         base_options=python.BaseOptions(
             model_asset_path=str(HAND_MODEL_PATH)
@@ -458,7 +460,6 @@ def main():
         min_tracking_confidence=0.5
     )
 
-    # Configure Face Landmarker
     face_options = vision.FaceLandmarkerOptions(
         base_options=python.BaseOptions(
             model_asset_path=str(FACE_MODEL_PATH)
@@ -479,7 +480,6 @@ def main():
             "Could not open webcam. Check CAMERA_INDEX."
         )
 
-    # A larger camera frame can improve landmark readability.
     camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
@@ -487,7 +487,7 @@ def main():
 
     print("=" * 48)
     print("CV SNIPER - STAGE 3")
-    print("Hand tracking + scope + blink-to-fire")
+    print("Hand + face tracking + scope + blink-to-fire")
     print("Raise your hand to equip the weapon.")
     print("Make a finger-gun gesture to scope in.")
     print("Blink while scoped to trigger FIRE.")
@@ -510,13 +510,10 @@ def main():
                     print("Could not read a webcam frame.")
                     break
 
-                # Mirror the webcam for a natural preview.
                 frame = cv2.flip(frame, 1)
 
-                # MediaPipe expects RGB input.
                 rgb_frame = cv2.cvtColor(
-                    frame,
-                    cv2.COLOR_BGR2RGB
+                    frame, cv2.COLOR_BGR2RGB
                 )
 
                 mp_image = mp.Image(
@@ -524,67 +521,51 @@ def main():
                     data=rgb_frame
                 )
 
-                # VIDEO mode timestamps must increase.
                 timestamp_ms = time.monotonic_ns() // 1_000_000
-
                 timestamp_ms = max(
                     timestamp_ms,
                     previous_timestamp_ms + 1
                 )
-
                 previous_timestamp_ms = timestamp_ms
 
-                # Run both detectors on the same frame.
+                # Run both detectors.
                 hand_result = hand_detector.detect_for_video(
-                    mp_image,
-                    timestamp_ms
+                    mp_image, timestamp_ms
                 )
 
                 face_result = face_detector.detect_for_video(
-                    mp_image,
-                    timestamp_ms
+                    mp_image, timestamp_ms
                 )
 
                 # ---------------- HAND DETECTION ----------------
 
-                hand_detected = bool(
-                    hand_result.hand_landmarks
-                )
+                hand_detected = bool(hand_result.hand_landmarks)
 
+                hand = None
                 finger_gun = False
                 hand_raised = False
 
                 if hand_detected:
                     hand = hand_result.hand_landmarks[0]
 
-                    draw_hand_landmarks(
-                        frame,
-                        hand
-                    )
-
                     finger_gun = detect_finger_gun(hand)
                     hand_raised = is_hand_raised(hand)
 
-                # ---------------- STATE MACHINE -----------------
+                # ---------------- GAME STATE --------------------
 
                 if state == GameState.IDLE:
-
                     if hand_detected and hand_raised:
                         state = GameState.EQUIPPED
 
                 elif state == GameState.EQUIPPED:
-
                     if not hand_detected:
                         state = GameState.IDLE
-
                     elif finger_gun:
                         state = GameState.SCOPED
 
                 elif state == GameState.SCOPED:
-
                     if not hand_detected:
                         state = GameState.IDLE
-
                     elif not finger_gun:
                         state = GameState.EQUIPPED
 
@@ -599,13 +580,11 @@ def main():
                     ear = get_eye_aspect_ratio(face)
 
                     if eye_state == EyeState.OPEN:
-
                         if ear < CLOSED_THRESHOLD:
                             eye_state = EyeState.CLOSED
                             blink_start_time = timestamp_ms
 
                     elif eye_state == EyeState.CLOSED:
-
                         if ear > OPEN_THRESHOLD:
                             blink_duration = (
                                 timestamp_ms - blink_start_time
@@ -620,16 +599,8 @@ def main():
                             ):
                                 blink_event = True
 
-                else:
-                    # Do not assume the eyes are open if the face
-                    # temporarily disappears from the camera.
-                    pass
-
                 # ---------------- FIRE EVENT --------------------
 
-                action = "READY"
-
-                # A blink only fires when the weapon is scoped.
                 if (
                     state == GameState.SCOPED
                     and blink_event
@@ -639,32 +610,43 @@ def main():
                     last_fire_time = timestamp_ms
                     last_fire_display_time = timestamp_ms
 
-                    action = "FIRE"
+                    print(f"[{timestamp_ms}] FIRE EVENT")
 
-                    print(
-                        f"[{timestamp_ms}] FIRE EVENT"
-                    )
-
-                # Keep the firing indicator visible briefly.
                 firing = (
                     timestamp_ms - last_fire_display_time
                     < FIRE_DISPLAY_MS
                 )
 
-                if firing:
-                    action = "FIRE"
-
+                action = "FIRE" if firing else "READY"
                 eye_status = eye_state.name
 
-                # ---------------- DRAW SCOPE --------------------
+                # ---------------- RENDERING ORDER ----------------
+                # 1. Scope background
+                # 2. Hand skeleton
+                # 3. Face and eye landmarks
+                # 4. HUD on top
 
                 if state == GameState.SCOPED:
-                    draw_scope(
-                        frame,
-                        firing=firing
-                    )
+                    draw_scope(frame, firing=firing)
 
-                # ---------------- DRAW HUD ----------------------
+                if hand is not None:
+                    draw_hand_landmarks(frame, hand)
+
+                if face_result.face_landmarks:
+                    draw_face_landmarks(
+                        frame,
+                        face_result.face_landmarks[0]
+                    )
+                else:
+                    cv2.putText(
+                        frame,
+                        "FACE TRACKING: NO FACE",
+                        (frame.shape[1] - 290, 35),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 0, 255),
+                        2
+                    )
 
                 draw_hud(
                     frame=frame,
@@ -673,18 +655,12 @@ def main():
                     finger_gun=finger_gun,
                     eye_status=eye_status,
                     ear=ear,
-                    action=action,
-                    blink_event=firing
+                    action=action
                 )
 
-                cv2.imshow(
-                    WINDOW_NAME,
-                    frame
-                )
+                cv2.imshow(WINDOW_NAME, frame)
 
-                key = cv2.waitKey(1) & 0xFF
-
-                if key == ord("q"):
+                if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
 
     finally:
@@ -693,8 +669,6 @@ def main():
 
     print("CV Sniper stopped.")
 
-
-# -------------------- ENTRY POINT --------------------------
 
 if __name__ == "__main__":
     main()
