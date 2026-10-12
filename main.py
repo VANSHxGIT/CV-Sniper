@@ -3,162 +3,42 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import math
+import random
 import time
-
-from enum import Enum
+from enum import Enum, auto
 from pathlib import Path
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
 
-# ============================================================
-# CV SNIPER - STAGE 3
-# Hand Tracking | Face Tracking | Sniper Scope | Blink-to-Fire
-# ============================================================
+# ===================== CONFIGURATION =====================
 
 BASE_DIR = Path(__file__).resolve().parent
-
 HAND_MODEL = BASE_DIR / "models" / "hand_landmarker.task"
 FACE_MODEL = BASE_DIR / "models" / "face_landmarker.task"
 
 CAMERA_INDEX = 0
+WINDOW = "CV Sniper - Stage 4"
 
-# Hand activation thresholds
-WRIST_RAISED_Y = 0.75
-HAND_CENTER_RAISED_Y = 0.65
+SCOPE_RADIUS = 155
+TARGET_COUNT = 4
+TARGET_RADIUS = (22, 34)
+TARGET_SPEED = (75, 150)
 
-# Eye blink thresholds (may need calibration)
-CLOSED_THRESHOLD = 0.20
-OPEN_THRESHOLD = 0.23
+AIM_SMOOTHING = 0.30
+FIRE_COOLDOWN = 0.80       # seconds
+SHOT_EFFECT_DURATION = 0.18
+HIT_MARKER_DURATION = 0.55
+GESTURE_GRACE = 0.40
+HAND_LOST_TIMEOUT = 1.0
 
-MIN_BLINK_MS = 50
-MAX_BLINK_MS = 500
-
-FIRE_COOLDOWN_MS = 800
-FIRE_DISPLAY_MS = 450
-
-WINDOW_NAME = "CV SNIPER - STAGE 3"
-
-
-# ============================================================
-# GAME STATES
-# ============================================================
-
-class GameState(Enum):
-    IDLE = 0
-    EQUIPPED = 1
-    SCOPED = 2
-
-
-class EyeState(Enum):
-    OPEN = 0
-    CLOSED = 1
-
-
-state = GameState.IDLE
-eye_state = EyeState.OPEN
-
-blink_start_ms = 0
-last_fire_ms = -FIRE_COOLDOWN_MS
-last_fire_display_ms = -FIRE_DISPLAY_MS
-
-
-# ============================================================
-# HAND GEOMETRY AND GESTURE DETECTION
-# ============================================================
-
-def distance(a, b):
-    return math.hypot(a.x - b.x, a.y - b.y)
-
-
-def finger_is_extended(hand, tip, pip):
-    wrist = hand[0]
-
-    return (
-        distance(hand[tip], wrist)
-        > distance(hand[pip], wrist) * 1.15
-    )
-
-
-def thumb_is_extended(hand):
-    wrist = hand[0]
-
-    return (
-        distance(hand[4], wrist)
-        > distance(hand[3], wrist) * 1.10
-    )
-
-
-def detect_finger_gun(hand):
-    index = finger_is_extended(hand, 8, 6)
-    middle = finger_is_extended(hand, 12, 10)
-    ring = finger_is_extended(hand, 16, 14)
-    pinky = finger_is_extended(hand, 20, 18)
-    thumb = thumb_is_extended(hand)
-
-    return (
-        index
-        and thumb
-        and not middle
-        and not ring
-        and not pinky
-    )
-
-
-def get_hand_center(hand):
-    return (
-        sum(p.x for p in hand) / len(hand),
-        sum(p.y for p in hand) / len(hand)
-    )
-
-
-def is_hand_raised(hand):
-    # MediaPipe coordinates start at the top-left:
-    # smaller Y values are higher on the screen.
-    wrist_y = hand[0].y
-    _, center_y = get_hand_center(hand)
-
-    return (
-        wrist_y < WRIST_RAISED_Y
-        or center_y < HAND_CENTER_RAISED_Y
-    )
-
-
-# ============================================================
-# FACE / EYE TRACKING
-# ============================================================
+CLOSED_EAR = 0.20
+OPEN_EAR = 0.235
+MIN_BLINK_DURATION = 0.05
+MAX_BLINK_DURATION = 0.50
 
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [362, 385, 387, 263, 373, 380]
-
-
-def eye_aspect_ratio(face, indices):
-    p1, p2, p3, p4, p5, p6 = [
-        face[i] for i in indices
-    ]
-
-    vertical_1 = distance(p2, p6)
-    vertical_2 = distance(p3, p5)
-    horizontal = distance(p1, p4)
-
-    if horizontal < 1e-6:
-        return 0.0
-
-    return (
-        vertical_1 + vertical_2
-    ) / (2.0 * horizontal)
-
-
-def get_ear(face):
-    left = eye_aspect_ratio(face, LEFT_EYE)
-    right = eye_aspect_ratio(face, RIGHT_EYE)
-
-    return (left + right) / 2.0
-
-
-# ============================================================
-# DRAW HAND LANDMARKS
-# ============================================================
 
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
@@ -166,566 +46,552 @@ HAND_CONNECTIONS = [
     (5, 9), (9, 10), (10, 11), (11, 12),
     (9, 13), (13, 14), (14, 15), (15, 16),
     (13, 17), (17, 18), (18, 19), (19, 20),
-    (0, 17)
+    (0, 17),
 ]
 
 
-def draw_hand_landmarks(frame, hand):
-    height, width = frame.shape[:2]
+class GameState(Enum):
+    IDLE = auto()
+    EQUIPPED = auto()
+    SCOPED = auto()
 
-    points = [
-        (
-            int(point.x * width),
-            int(point.y * height)
-        )
-        for point in hand
-    ]
 
-    for start, end in HAND_CONNECTIONS:
-        cv2.line(
-            frame,
-            points[start],
-            points[end],
-            (0, 255, 0),
-            2,
-            cv2.LINE_AA
-        )
+# ===================== GESTURE / EYE DETECTION =====================
+
+def distance(a, b):
+    return math.hypot(a.x - b.x, a.y - b.y)
+
+
+def finger_extended(hand, tip, pip):
+    wrist = hand[0]
+    return distance(hand[tip], wrist) > distance(hand[pip], wrist) * 1.15
+
+
+def detect_finger_gun(hand):
+    index = finger_extended(hand, 8, 6)
+    middle = finger_extended(hand, 12, 10)
+    ring = finger_extended(hand, 16, 14)
+    pinky = finger_extended(hand, 20, 18)
+    thumb = distance(hand[4], hand[0]) > distance(hand[3], hand[0]) * 1.10
+
+    return index and thumb and not middle and not ring and not pinky
+
+
+def hand_is_raised(hand):
+    wrist_y = hand[0].y
+    palm_y = sum(hand[i].y for i in (0, 5, 9, 13, 17)) / 5
+    return wrist_y < 0.75 or palm_y < 0.65
+
+
+def eye_aspect_ratio(face, indices):
+    p1, p2, p3, p4, p5, p6 = [face[i] for i in indices]
+    horizontal = distance(p1, p4)
+
+    if horizontal < 1e-6:
+        return 1.0
+
+    return (
+        distance(p2, p6) + distance(p3, p5)
+    ) / (2.0 * horizontal)
+
+
+# ===================== DRAWING =====================
+
+def pixel_point(landmark, width, height):
+    return (
+        int(np.clip(landmark.x * width, 0, width - 1)),
+        int(np.clip(landmark.y * height, 0, height - 1)),
+    )
+
+
+def draw_hand(frame, hand):
+    h, w = frame.shape[:2]
+    points = [pixel_point(lm, w, h) for lm in hand]
+
+    for a, b in HAND_CONNECTIONS:
+        cv2.line(frame, points[a], points[b],
+                 (70, 255, 100), 2, cv2.LINE_AA)
 
     for point in points:
-        cv2.circle(
-            frame,
-            point,
-            4,
-            (0, 180, 255),
-            -1,
-            cv2.LINE_AA
+        cv2.circle(frame, point, 4, (40, 230, 255), -1, cv2.LINE_AA)
+
+
+def draw_face_eyes(frame, face):
+    h, w = frame.shape[:2]
+
+    for indices in (LEFT_EYE, RIGHT_EYE):
+        points = np.array(
+            [pixel_point(face[i], w, h) for i in indices],
+            dtype=np.int32
         )
+        cv2.polylines(frame, [points], True, (255, 220, 60), 2,
+                      cv2.LINE_AA)
+
+        for x, y in points:
+            cv2.circle(frame, (x, y), 3, (255, 255, 0), -1,
+                       cv2.LINE_AA)
 
 
-# ============================================================
-# DRAW FACE LANDMARKS AND EYE OUTLINES
-# ============================================================
-
-def draw_face_landmarks(frame, face):
-    height, width = frame.shape[:2]
-
-    # All detected facial landmarks
-    for landmark in face:
-        x = int(landmark.x * width)
-        y = int(landmark.y * height)
-
-        if 0 <= x < width and 0 <= y < height:
-            cv2.circle(
-                frame,
-                (x, y),
-                1,
-                (255, 200, 0),
-                -1
-            )
-
-    # Eye outlines
-    eye_paths = [
-        [33, 160, 158, 133, 153, 144, 33],
-        [362, 385, 387, 263, 373, 380, 362]
-    ]
-
-    for path in eye_paths:
-        points = []
-
-        for index in path:
-            landmark = face[index]
-
-            points.append((
-                int(landmark.x * width),
-                int(landmark.y * height)
-            ))
-
-        for i in range(len(points) - 1):
-            cv2.line(
-                frame,
-                points[i],
-                points[i + 1],
-                (0, 255, 255),
-                2,
-                cv2.LINE_AA
-            )
-
-
-# ============================================================
-# SNIPER SCOPE
-# ============================================================
-
-def draw_scope(frame, firing=False):
-    height, width = frame.shape[:2]
-
-    cx = width // 2
-    cy = height // 2
-    radius = max(100, min(width, height) // 3)
+def draw_scope(frame, center, radius, recoil=False):
+    h, w = frame.shape[:2]
+    cx = int(np.clip(center[0], 0, w - 1))
+    cy = int(np.clip(center[1], 0, h - 1))
 
     original = frame.copy()
+    dark = cv2.convertScaleAbs(original, alpha=0.35, beta=0)
 
-    # Darkened background
-    darkened = cv2.convertScaleAbs(
-        original,
-        alpha=0.35,
-        beta=0
-    )
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.circle(mask, (cx, cy), radius, 255, -1)
 
-    # Circular mask: white inside the scope, black outside.
-    mask = np.zeros((height, width), dtype=np.uint8)
-
-    cv2.circle(
-        mask,
-        (cx, cy),
-        radius,
-        255,
-        -1
-    )
-
-    # Original video inside the scope.
-    inside = cv2.bitwise_and(
-        original,
-        original,
-        mask=mask
-    )
-
-    # Darkened video outside the scope.
-    outside = cv2.bitwise_and(
-        darkened,
-        darkened,
-        mask=cv2.bitwise_not(mask)
-    )
-
+    inside = cv2.bitwise_and(original, original, mask=mask)
+    outside = cv2.bitwise_and(dark, dark, mask=cv2.bitwise_not(mask))
     frame[:] = cv2.add(inside, outside)
 
-    color = (0, 0, 255) if firing else (0, 255, 0)
+    cv2.circle(frame, (cx, cy), radius, (220, 235, 220), 3,
+               cv2.LINE_AA)
 
-    # Outer scope ring
-    cv2.circle(
-        frame,
-        (cx, cy),
-        radius,
-        color,
-        3,
-        cv2.LINE_AA
-    )
+    color = (30, 40, 255) if recoil else (50, 255, 90)
+    gap, length = 12, 38
 
-    # Crosshair
-    cv2.line(
-        frame,
-        (cx - radius, cy),
-        (cx + radius, cy),
-        (255, 255, 255),
-        1
-    )
+    cv2.line(frame, (cx - length, cy), (cx - gap, cy),
+             color, 2, cv2.LINE_AA)
+    cv2.line(frame, (cx + gap, cy), (cx + length, cy),
+             color, 2, cv2.LINE_AA)
+    cv2.line(frame, (cx, cy - length), (cx, cy - gap),
+             color, 2, cv2.LINE_AA)
+    cv2.line(frame, (cx, cy + gap), (cx, cy + length),
+             color, 2, cv2.LINE_AA)
+    cv2.circle(frame, (cx, cy), 3, color, -1, cv2.LINE_AA)
 
-    cv2.line(
-        frame,
-        (cx, cy - radius),
-        (cx, cy + radius),
-        (255, 255, 255),
-        1
-    )
-
-    # Inner aiming marks
-    gap = 18
-
-    cv2.line(
-        frame,
-        (cx - 40, cy),
-        (cx - gap, cy),
-        color,
-        2
-    )
-
-    cv2.line(
-        frame,
-        (cx + gap, cy),
-        (cx + 40, cy),
-        color,
-        2
-    )
-
-    cv2.line(
-        frame,
-        (cx, cy - 40),
-        (cx, cy - gap),
-        color,
-        2
-    )
-
-    cv2.line(
-        frame,
-        (cx, cy + gap),
-        (cx, cy + 40),
-        color,
-        2
-    )
-
-    cv2.circle(
-        frame,
-        (cx, cy),
-        4,
-        color,
-        -1
-    )
-
-    cv2.putText(
-        frame,
-        "LIVE SCOPE",
-        (cx - 65, max(30, cy - radius - 15)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        color,
-        2
-    )
-
-    if firing:
-        cv2.putText(
-            frame,
-            "FIRE!",
-            (cx - 45, min(height - 20, cy + radius + 35)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 0, 255),
-            3
-        )
+    for angle_deg in range(0, 360, 30):
+        angle = math.radians(angle_deg)
+        r1, r2 = radius - 13, radius - 4
+        p1 = (int(cx + math.cos(angle) * r1),
+              int(cy + math.sin(angle) * r1))
+        p2 = (int(cx + math.cos(angle) * r2),
+              int(cy + math.sin(angle) * r2))
+        cv2.line(frame, p1, p2, (220, 235, 220), 1, cv2.LINE_AA)
 
 
-# ============================================================
-# HUD / DIAGNOSTICS
-# ============================================================
+def new_target(width, height):
+    r = random.randint(*TARGET_RADIUS)
+    margin = r + 12
+    x = random.randint(margin, max(margin, width - margin - 1))
+    y_min = min(height - 1, margin + 60)
+    y_max = max(y_min, height - margin - 15)
+    y = random.randint(y_min, y_max)
 
-def draw_hud(
-    frame,
-    game_state,
-    hand_detected,
-    hand_raised,
-    finger_gun,
-    face_detected,
-    eye_status,
-    ear,
-    action
-):
-    height, width = frame.shape[:2]
+    angle = random.uniform(0, math.tau)
+    speed = random.uniform(*TARGET_SPEED)
 
-    # HUD background
+    return {
+        "x": float(x), "y": float(y), "r": r,
+        "vx": math.cos(angle) * speed,
+        "vy": math.sin(angle) * speed,
+        "alive": True, "respawn": 0.0
+    }
+
+
+def update_targets(targets, width, height, dt, now):
+    for target in targets:
+        if not target["alive"]:
+            if now >= target["respawn"]:
+                target.update(new_target(width, height))
+            continue
+
+        target["x"] += target["vx"] * dt
+        target["y"] += target["vy"] * dt
+        r = target["r"]
+
+        if target["x"] < r or target["x"] > width - r:
+            target["vx"] *= -1
+            target["x"] = float(np.clip(target["x"], r, width - r))
+
+        low_y = min(height - r, r + 45)
+        high_y = max(low_y, height - r - 10)
+
+        if target["y"] < low_y or target["y"] > high_y:
+            target["vy"] *= -1
+            target["y"] = float(np.clip(target["y"], low_y, high_y))
+
+
+def draw_targets(frame, targets):
+    for target in targets:
+        if not target["alive"]:
+            continue
+
+        x, y, r = int(target["x"]), int(target["y"]), target["r"]
+        color = (60, 220, 255)
+
+        cv2.circle(frame, (x, y), r, color, 2, cv2.LINE_AA)
+        cv2.circle(frame, (x, y), int(r * 0.62), color, 2,
+                   cv2.LINE_AA)
+        cv2.circle(frame, (x, y), max(3, int(r * 0.18)),
+                   color, -1, cv2.LINE_AA)
+        cv2.line(frame, (x - r - 7, y), (x + r + 7, y),
+                 color, 1, cv2.LINE_AA)
+        cv2.line(frame, (x, y - r - 7), (x, y + r + 7),
+                 color, 1, cv2.LINE_AA)
+
+
+def draw_shot_effect(frame, center, elapsed):
+    if not 0 <= elapsed < SHOT_EFFECT_DURATION:
+        return
+
+    cx, cy = map(int, center)
+    progress = elapsed / SHOT_EFFECT_DURATION
+    radius = int(35 * (1 - progress)) + 8
+
     overlay = frame.copy()
+    cv2.circle(overlay, (cx, cy), radius, (80, 220, 255),
+               -1, cv2.LINE_AA)
 
-    cv2.rectangle(
-        overlay,
-        (10, 10),
-        (365, 290),
-        (10, 10, 10),
-        -1
-    )
+    for angle_deg in range(0, 360, 45):
+        angle = math.radians(angle_deg)
+        p1 = (int(cx + math.cos(angle) * (radius + 5)),
+              int(cy + math.sin(angle) * (radius + 5)))
+        p2 = (int(cx + math.cos(angle) * (radius + 25)),
+              int(cy + math.sin(angle) * (radius + 25)))
+        cv2.line(overlay, p1, p2, (100, 245, 255), 3, cv2.LINE_AA)
 
-    cv2.addWeighted(
-        overlay,
-        0.78,
-        frame,
-        0.22,
-        0,
-        frame
-    )
+    alpha = 0.45 * (1 - progress)
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
 
-    state_color = (
-        (0, 255, 0)
-        if game_state == GameState.SCOPED
-        else (0, 220, 255)
-    )
+
+def draw_hit_marker(frame, center, label, color):
+    cx, cy = map(int, center)
+    size = 15
+
+    for sx in (-1, 1):
+        for sy in (-1, 1):
+            cv2.line(
+                frame,
+                (cx + sx * size, cy + sy * size),
+                (cx + sx * 5, cy + sy * 5),
+                color, 3, cv2.LINE_AA
+            )
+
+    cv2.putText(frame, label, (cx + 22, cy - 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2,
+                cv2.LINE_AA)
+
+
+def draw_hud(frame, state, hand_seen, raised, finger_gun,
+             face_seen, eyes, ear, score, hits, shots, action, fps,
+             last_shot, now):
+    h, w = frame.shape[:2]
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (10, 10), (345, 225), (10, 18, 22), -1)
+    cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+
+    state_color = {
+        GameState.IDLE: (180, 180, 180),
+        GameState.EQUIPPED: (0, 220, 255),
+        GameState.SCOPED: (70, 255, 100)
+    }[state]
 
     lines = [
-        ("CV SNIPER | STAGE 3", (255, 255, 255)),
-        ("WEAPON: SNIPER RIFLE", (255, 255, 255)),
-        (f"STATE: {game_state.name}", state_color),
-        (
-            f"HAND DETECTED: {'YES' if hand_detected else 'NO'}",
-            (0, 255, 0) if hand_detected else (0, 0, 255)
-        ),
-        (
-            f"HAND RAISED: {'YES' if hand_raised else 'NO'}",
-            (0, 255, 0) if hand_raised else (180, 180, 180)
-        ),
-        (
-            f"FINGER GUN: {'YES' if finger_gun else 'NO'}",
-            (0, 255, 0) if finger_gun else (180, 180, 180)
-        ),
-        (
-            f"FACE: {'DETECTED' if face_detected else 'NOT FOUND'}",
-            (0, 255, 0) if face_detected else (0, 0, 255)
-        ),
-        (f"EYES: {eye_status}", (255, 255, 255)),
-        (f"EAR: {ear:.3f}", (255, 255, 255)),
-        (
-            f"ACTION: {action}",
-            (0, 0, 255) if action == "FIRE"
-            else (255, 255, 255)
-        )
+        ("CV SNIPER | STAGE 4", (255, 255, 255)),
+        (f"STATE: {state.name}", state_color),
+        (f"HAND: {hand_seen}  RAISED: {raised}", (220, 240, 240)),
+        (f"FINGER GUN: {finger_gun}", (220, 240, 240)),
+        (f"FACE: {face_seen}  EYES: {eyes}", (220, 240, 240)),
+        (f"EAR: {ear:.3f}", (200, 220, 220)),
+        (f"SCORE: {score}  HITS: {hits}/{shots}", (80, 255, 110)),
+        (f"ACTION: {action}", (255, 230, 100)),
+        (f"FPS: {fps:.1f}", (180, 190, 190)),
     ]
 
     y = 35
+    for i, (text, color) in enumerate(lines):
+        cv2.putText(frame, text, (20, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.53 if i else 0.57, color, 2 if i == 0 else 1,
+                    cv2.LINE_AA)
+        y += 23
 
-    for text, color in lines:
-        cv2.putText(
-            frame,
-            text,
-            (22, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.47,
-            color,
-            1,
-            cv2.LINE_AA
-        )
-        y += 26
+    if state == GameState.IDLE:
+        instruction = "Raise hand or show finger-gun to start"
+    elif state == GameState.EQUIPPED:
+        instruction = "Make finger-gun gesture to scope in"
+    else:
+        instruction = "Aim with index finger; blink to fire"
 
-    cv2.putText(
-        frame,
-        "Q: QUIT",
-        (width - 110, height - 20),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (255, 255, 255),
-        1
-    )
+    cv2.putText(frame, instruction, (15, h - 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.56, (245, 245, 245),
+                2, cv2.LINE_AA)
+
+    if last_shot is not None:
+        remaining = FIRE_COOLDOWN - (now - last_shot)
+        if remaining > 0:
+            cv2.putText(frame, f"RELOAD {remaining:.1f}s",
+                        (w - 170, 35), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.65, (0, 220, 255), 2, cv2.LINE_AA)
 
 
-# ============================================================
-# MAIN
-# ============================================================
+# ===================== MAIN GAME LOOP =====================
 
 def main():
-    global state
-    global eye_state
-    global blink_start_ms
-    global last_fire_ms
-    global last_fire_display_ms
-
-    for model_path in (HAND_MODEL, FACE_MODEL):
-        if not model_path.is_file():
-            raise FileNotFoundError(
-                f"Model not found: {model_path}"
-            )
+    if not HAND_MODEL.exists():
+        raise FileNotFoundError(f"Missing hand model: {HAND_MODEL}")
+    if not FACE_MODEL.exists():
+        raise FileNotFoundError(f"Missing face model: {FACE_MODEL}")
 
     hand_options = vision.HandLandmarkerOptions(
-        base_options=python.BaseOptions(
-            model_asset_path=str(HAND_MODEL)
-        ),
+        base_options=python.BaseOptions(model_asset_path=str(HAND_MODEL)),
         running_mode=vision.RunningMode.VIDEO,
         num_hands=1,
         min_hand_detection_confidence=0.5,
         min_hand_presence_confidence=0.5,
-        min_tracking_confidence=0.5
+        min_tracking_confidence=0.5,
     )
 
     face_options = vision.FaceLandmarkerOptions(
-        base_options=python.BaseOptions(
-            model_asset_path=str(FACE_MODEL)
-        ),
+        base_options=python.BaseOptions(model_asset_path=str(FACE_MODEL)),
         running_mode=vision.RunningMode.VIDEO,
         num_faces=1,
         min_face_detection_confidence=0.5,
         min_face_presence_confidence=0.5,
         min_tracking_confidence=0.5,
         output_face_blendshapes=False,
-        output_facial_transformation_matrixes=False
+        output_facial_transformation_matrixes=False,
     )
 
-    camera = cv2.VideoCapture(CAMERA_INDEX)
-
+    camera = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
     if not camera.isOpened():
-        raise RuntimeError(
-            "Cannot open webcam. Check CAMERA_INDEX."
-        )
+        camera = cv2.VideoCapture(CAMERA_INDEX)
+    if not camera.isOpened():
+        raise RuntimeError("Cannot open webcam. Close other camera apps.")
 
     camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-    previous_timestamp_ms = 0
+    state = GameState.IDLE
+    score = hits = shots = 0
+    targets = []
+    aim_x = aim_y = None
 
-    print("=" * 55)
-    print("CV SNIPER - STAGE 3")
-    print("Raise your hand: EQUIPPED")
-    print("Make a finger gun: SCOPED")
-    print("Blink while scoped: FIRE")
-    print("Press Q to quit.")
-    print("=" * 55)
+    last_shot = None
+    shot_time = -10.0
+    last_result_time = -10.0
+    last_result_center = (0, 0)
+    last_result_label = ""
+    last_result_color = (255, 255, 255)
+
+    closed_since = None
+    last_blink = -10.0
+    last_hand_seen = -10.0
+    last_gesture_seen = -10.0
+
+    action = "READY"
+    previous_time = time.monotonic()
+    last_timestamp_ms = 0
+    fps = 0.0
 
     try:
         with (
-            vision.HandLandmarker.create_from_options(
-                hand_options
-            ) as hand_detector,
-            vision.FaceLandmarker.create_from_options(
-                face_options
-            ) as face_detector
+            vision.HandLandmarker.create_from_options(hand_options) as hand_detector,
+            vision.FaceLandmarker.create_from_options(face_options) as face_detector
         ):
             while True:
-                success, frame = camera.read()
-
-                if not success:
-                    print("Unable to read webcam frame.")
+                ok, frame = camera.read()
+                if not ok:
+                    print("Could not read webcam frame.")
                     break
 
+                # Mirror the image for natural hand-controlled aiming.
                 frame = cv2.flip(frame, 1)
+                h, w = frame.shape[:2]
+                now = time.monotonic()
+                dt = min(now - previous_time, 0.05)
+                previous_time = now
 
-                rgb = cv2.cvtColor(
-                    frame,
-                    cv2.COLOR_BGR2RGB
-                )
+                if dt > 0:
+                    instant_fps = 1.0 / dt
+                    fps = instant_fps if fps == 0 else fps * 0.9 + instant_fps * 0.1
 
-                mp_image = mp.Image(
-                    image_format=mp.ImageFormat.SRGB,
-                    data=rgb
-                )
+                timestamp_ms = max(int(now * 1000), last_timestamp_ms + 1)
+                last_timestamp_ms = timestamp_ms
 
-                # Monotonic timestamps for VIDEO mode.
-                timestamp_ms = time.monotonic_ns() // 1_000_000
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-                timestamp_ms = max(
-                    timestamp_ms,
-                    previous_timestamp_ms + 1
-                )
+                hand_result = hand_detector.detect_for_video(mp_image, timestamp_ms)
+                face_result = face_detector.detect_for_video(mp_image, timestamp_ms)
 
-                previous_timestamp_ms = timestamp_ms
+                hand_seen = bool(hand_result.hand_landmarks)
+                face_seen = bool(face_result.face_landmarks)
+                hand = hand_result.hand_landmarks[0] if hand_seen else None
+                face = face_result.face_landmarks[0] if face_seen else None
 
-                # Run both models.
-                hand_result = hand_detector.detect_for_video(
-                    mp_image,
-                    timestamp_ms
-                )
+                raised = hand_is_raised(hand) if hand_seen else False
+                finger_gun = detect_finger_gun(hand) if hand_seen else False
 
-                face_result = face_detector.detect_for_video(
-                    mp_image,
-                    timestamp_ms
-                )
+                if hand_seen:
+                    last_hand_seen = now
+                    draw_hand(frame, hand)
 
-                # ---------------- HAND ----------------
+                    # Index fingertip controls the crosshair and scope.
+                    raw_x = float(np.clip(hand[8].x, 0, 1)) * w
+                    raw_y = float(np.clip(hand[8].y, 0, 1)) * h
 
-                hand_detected = bool(hand_result.hand_landmarks)
+                    if aim_x is None:
+                        aim_x, aim_y = raw_x, raw_y
+                    else:
+                        aim_x += (raw_x - aim_x) * AIM_SMOOTHING
+                        aim_y += (raw_y - aim_y) * AIM_SMOOTHING
 
-                hand = None
-                finger_gun = False
-                hand_raised = False
+                if finger_gun:
+                    last_gesture_seen = now
 
-                if hand_detected:
-                    hand = hand_result.hand_landmarks[0]
-
-                    finger_gun = detect_finger_gun(hand)
-                    hand_raised = is_hand_raised(hand)
-
-                # ---------------- STATE MACHINE ----------------
-
+                # State transitions; short gesture gaps won't instantly drop scope.
                 if state == GameState.IDLE:
-                    if hand_detected:
-                        if finger_gun:
-                            # Permit direct entry into scope when
-                            # the finger-gun gesture is recognized.
-                            state = GameState.SCOPED
-                        elif hand_raised:
-                            state = GameState.EQUIPPED
+                    if hand_seen and finger_gun:
+                        state = GameState.SCOPED
+                        action = "SCOPE ACQUIRED"
+                    elif hand_seen and raised:
+                        state = GameState.EQUIPPED
+                        action = "RIFLE EQUIPPED"
 
                 elif state == GameState.EQUIPPED:
-                    if not hand_detected:
-                        state = GameState.IDLE
-                    elif finger_gun:
+                    if finger_gun:
                         state = GameState.SCOPED
+                        action = "SCOPE ACQUIRED"
+                    elif now - last_hand_seen > HAND_LOST_TIMEOUT:
+                        state = GameState.IDLE
+                        action = "HAND LOST"
 
                 elif state == GameState.SCOPED:
-                    if not hand_detected:
+                    if now - last_hand_seen > HAND_LOST_TIMEOUT:
                         state = GameState.IDLE
-                    elif not finger_gun:
-                        state = GameState.EQUIPPED
+                        action = "HAND LOST"
+                    elif now - last_gesture_seen > GESTURE_GRACE:
+                        state = GameState.EQUIPPED if hand_seen else GameState.IDLE
+                        action = "SCOPE RELEASED"
 
-                # ---------------- FACE / BLINK ----------------
+                if not targets:
+                    targets = [new_target(w, h) for _ in range(TARGET_COUNT)]
 
-                face_detected = bool(face_result.face_landmarks)
+                update_targets(targets, w, h, dt, now)
 
-                ear = 0.0
+                # Blink detection: register on reopening, not continuously while closed.
+                ear = 1.0
+                eyes = "UNKNOWN"
                 blink_event = False
 
-                if face_detected:
-                    face = face_result.face_landmarks[0]
-                    ear = get_ear(face)
+                if face_seen:
+                    draw_face_eyes(frame, face)
+                    ear = (
+                        eye_aspect_ratio(face, LEFT_EYE)
+                        + eye_aspect_ratio(face, RIGHT_EYE)
+                    ) / 2.0
 
-                    if eye_state == EyeState.OPEN:
-                        if ear < CLOSED_THRESHOLD:
-                            eye_state = EyeState.CLOSED
-                            blink_start_ms = timestamp_ms
-
+                    if ear < CLOSED_EAR:
+                        eyes = "CLOSED"
+                        if closed_since is None:
+                            closed_since = now
                     else:
-                        if ear > OPEN_THRESHOLD:
-                            blink_duration = (
-                                timestamp_ms - blink_start_ms
-                            )
-
-                            eye_state = EyeState.OPEN
-
-                            if (
-                                MIN_BLINK_MS
-                                <= blink_duration
-                                <= MAX_BLINK_MS
-                            ):
+                        eyes = "OPEN"
+                        if closed_since is not None:
+                            duration = now - closed_since
+                            if MIN_BLINK_DURATION <= duration <= MAX_BLINK_DURATION:
                                 blink_event = True
+                            closed_since = None
+                else:
+                    closed_since = None
 
-                # ---------------- FIRING ----------------
+                # One shot per valid blink, only while scoped and off cooldown.
+                if blink_event and now - last_blink > 0.20:
+                    last_blink = now
 
-                if (
-                    state == GameState.SCOPED
-                    and blink_event
-                    and timestamp_ms - last_fire_ms
-                    >= FIRE_COOLDOWN_MS
-                ):
-                    last_fire_ms = timestamp_ms
-                    last_fire_display_ms = timestamp_ms
+                    if state != GameState.SCOPED:
+                        action = "BLINK IGNORED - SCOPE FIRST"
+                    elif last_shot is not None and now - last_shot < FIRE_COOLDOWN:
+                        action = "RELOADING"
+                    else:
+                        last_shot = now
+                        shot_time = now
+                        shots += 1
 
-                    print(f"[{timestamp_ms}] FIRE EVENT")
+                        shot_x = int(aim_x if aim_x is not None else w // 2)
+                        shot_y = int(aim_y if aim_y is not None else h // 2)
+                        shot_center = (shot_x, shot_y)
 
-                firing = (
-                    timestamp_ms - last_fire_display_ms
-                    < FIRE_DISPLAY_MS
+                        hit_index = None
+                        for i, target in enumerate(targets):
+                            if not target["alive"]:
+                                continue
+
+                            d = math.hypot(
+                                shot_x - target["x"],
+                                shot_y - target["y"]
+                            )
+                            if d <= target["r"] + 8:
+                                hit_index = i
+                                break
+
+                        if hit_index is not None:
+                            target = targets[hit_index]
+                            target["alive"] = False
+                            target["respawn"] = now + random.uniform(0.7, 1.5)
+                            score += 100
+                            hits += 1
+                            action = "TARGET HIT +100"
+                            last_result_label = "HIT!"
+                            last_result_color = (60, 255, 90)
+                        else:
+                            action = "SHOT MISSED"
+                            last_result_label = "MISS"
+                            last_result_color = (40, 80, 255)
+
+                        last_result_time = now
+                        last_result_center = shot_center
+
+                # Scope follows the smoothed fingertip.
+                aim_center = (
+                    int(aim_x if aim_x is not None else w // 2),
+                    int(aim_y if aim_y is not None else h // 2),
                 )
-
-                action = "FIRE" if firing else "READY"
-
-                # ---------------- RENDERING ----------------
-                # Draw scope first, then landmarks and HUD.
-                # This keeps the hand and face overlays visible.
+                recoil = now - shot_time < SHOT_EFFECT_DURATION
 
                 if state == GameState.SCOPED:
-                    draw_scope(frame, firing=firing)
+                    recoil_offset = int(10 * (1 - (now - shot_time) / SHOT_EFFECT_DURATION)) if recoil else 0
+                    scope_center = (
+                        aim_center[0],
+                        int(np.clip(aim_center[1] + recoil_offset, 0, h - 1))
+                    )
+                    draw_scope(frame, scope_center, SCOPE_RADIUS, recoil)
 
-                if hand is not None:
-                    draw_hand_landmarks(frame, hand)
+                # Targets are drawn after the scope so they remain visible.
+                draw_targets(frame, targets)
 
-                if face_detected:
-                    draw_face_landmarks(
-                        frame,
-                        face_result.face_landmarks[0]
+                if recoil:
+                    draw_shot_effect(frame, aim_center, now - shot_time)
+
+                if now - last_result_time < HIT_MARKER_DURATION:
+                    draw_hit_marker(
+                        frame, last_result_center,
+                        last_result_label, last_result_color
                     )
 
                 draw_hud(
-                    frame=frame,
-                    game_state=state,
-                    hand_detected=hand_detected,
-                    hand_raised=hand_raised,
-                    finger_gun=finger_gun,
-                    face_detected=face_detected,
-                    eye_status=eye_state.name,
-                    ear=ear,
-                    action=action
+                    frame, state, hand_seen, raised, finger_gun,
+                    face_seen, eyes, ear, score, hits, shots,
+                    action, fps, last_shot, now
                 )
 
-                cv2.imshow(WINDOW_NAME, frame)
+                cv2.imshow(WINDOW, frame)
+                key = cv2.waitKey(1) & 0xFF
 
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                if key in (ord("q"), 27):
                     break
+                if key == ord("r"):
+                    score = hits = shots = 0
+                    targets = [new_target(w, h) for _ in range(TARGET_COUNT)]
+                    action = "SCORE RESET"
 
     finally:
         camera.release()
         cv2.destroyAllWindows()
-
-    print("CV Sniper stopped.")
 
 
 if __name__ == "__main__":
