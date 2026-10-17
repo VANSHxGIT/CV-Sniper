@@ -1,6 +1,7 @@
 """Comprehensive automated test suite for CV Sniper."""
 
 import math
+import time
 import unittest
 from types import SimpleNamespace
 import numpy as np
@@ -254,6 +255,22 @@ class TestRenderer(unittest.TestCase):
         pt = pixel_point(lm_oob, 1280, 720)
         self.assertEqual(pt[0], 1279)
         self.assertEqual(pt[1], 0)
+
+
+class TestVisionDetector(unittest.TestCase):
+    """Test vision detector initialization and frame inference."""
+
+    def test_detector_inference(self):
+        from cv_controller.detector import VisionDetector
+
+        detector = VisionDetector()
+        mock_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        result = detector.detect(mock_frame, timestamp_ms=100)
+        self.assertFalse(result.hand_seen)
+        self.assertFalse(result.face_seen)
+        self.assertIsNone(result.aim_point)
+        self.assertEqual(result.ear, 1.0)
+        detector.close()
 
 
 if __name__ == "__main__":
