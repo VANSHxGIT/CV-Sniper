@@ -38,3 +38,13 @@ env/
 # Environment variables
 .env
 .env.local
+
+# Testing and tools
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Operating System files
+Thumbs.db
+.DS_Store
+*.tmp
